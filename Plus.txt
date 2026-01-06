@@ -1,0 +1,425 @@
+%%writefile plus.py
+#!/usr/bin/env python3
+"""
+MITM ATTACK VERSI TERBALIK:
+Trap table: T + k_trap * G
+Pencarian: n_step * G
+Collision: n_step * G = T + k_trap * G
+"""
+
+import time
+import sys
+import argparse
+import random
+import multiprocessing as mp
+import os
+from typing import Dict, List, Tuple, Optional
+from datetime import datetime
+
+import coincurve
+
+# =================================================================
+# KONSTANTA
+# =================================================================
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+G_COMPRESSED = bytes.fromhex("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+
+# =================================================================
+# KONFIGURASI DEFAULT
+# =================================================================
+DEFAULT_TOTAL_SCALARS = 24
+DEFAULT_START_EXPONENT = 1
+DEFAULT_SCALARS_PER_GROUP = 4
+# DEFAULT_NUM_GROUPS is derived: DEFAULT_TOTAL_SCALARS // DEFAULT_SCALARS_PER_GROUP
+
+# =================================================================
+# FUNGSI UTILITAS
+# =================================================================
+def decompress_pubkey(compressed_hex: str) -> coincurve.PublicKey:
+    """Dekompresi public key"""
+    return coincurve.PublicKey(bytes.fromhex(compressed_hex))
+
+def get_point_coordinates(pubkey: coincurve.PublicKey) -> Tuple[int, int]:
+    """Dapatkan koordinat x, y"""
+    uncompressed = pubkey.format(compressed=False)
+    x = int.from_bytes(uncompressed[1:33], 'big')
+    y = int.from_bytes(uncompressed[33:], 'big')
+    return x, y
+
+def point_negate(pubkey: coincurve.PublicKey) -> coincurve.PublicKey:
+    """Negasi titik: -P"""
+    x, y = get_point_coordinates(pubkey)
+    neg_y = (-y) % 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+    point_bytes = b'\x04' + x.to_bytes(32, 'big') + neg_y.to_bytes(32, 'big')
+    return coincurve.PublicKey(point_bytes)
+
+# =================================================================
+# SCALAR GROUP GENERATION
+# =================================================================
+def get_scalar_groups(
+    total_scalars: int,
+    start_exponent: int,
+    scalars_per_group: int
+) -> Tuple[List[List[int]], List[int]]:
+    """Generate scalar groups based on provided configuration"""
+    num_groups = total_scalars // scalars_per_group
+    if total_scalars % scalars_per_group != 0:
+        print("[WARNING] Total scalars is not perfectly divisible by scalars per group.")
+
+    full_scalars = [2**i for i in range(start_exponent, start_exponent + total_scalars)]
+    groups = []
+    for i in range(num_groups):
+        start = i * scalars_per_group
+        end = (i + 1) * scalars_per_group
+        groups.append(full_scalars[start:end])
+    return groups, full_scalars
+
+# =================================================================
+# FINGERPRINT
+# =================================================================
+def splitmix64(x: int) -> int:
+    """Fungsi hash deterministik 64-bit"""
+    x = (x + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9 & 0xFFFFFFFFFFFFFFFF
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EB & 0xFFFFFFFFFFFFFFFF
+    return (x ^ (x >> 31)) & 0xFFFFFFFFFFFFFFFF
+
+def get_fingerprint(pubkey: coincurve.PublicKey) -> int:
+    """Fingerprint 64-bit dari public key"""
+    x, y = get_point_coordinates(pubkey)
+    y_parity = y & 1
+    low64_x = x & 0xFFFFFFFFFFFFFFFF
+    return splitmix64(low64_x ^ y_parity)
+
+# =================================================================
+# GENERATE TRAP TABLE (VERSI TERBALIK)
+# =================================================================
+def generate_trap_table_reverse(
+    target_pubkey: coincurve.PublicKey,
+    trap_size: int
+) -> Dict[int, int]:
+    """
+    Trap table: T + k_trap * G untuk k_trap = 1..trap_size
+    """
+    print(f"[*] Generating trap table: T + k_trap * G")
+    start_time = time.time()
+
+    trap_dict = {}
+    # G_pubkey = coincurve.PublicKey(G_COMPRESSED) # Not needed here, G is implicit in kG
+
+    for k_trap in range(1, trap_size + 1):
+        # Hitung k_trap * G
+        k_trap_bytes = k_trap.to_bytes(32, 'big')
+        kG_pubkey = coincurve.PublicKey.from_valid_secret(k_trap_bytes)
+
+        # Hitung T + k_trap * G
+        T_plus_kG = coincurve.PublicKey.combine_keys([target_pubkey, kG_pubkey])
+
+        # Hitung fingerprint
+        fp = get_fingerprint(T_plus_kG)
+
+        # Simpan ke dictionary
+        trap_dict[fp] = k_trap
+
+    elapsed = time.time() - start_time
+    speed = trap_size / elapsed if elapsed > 0 else 0
+    print(f"[*] Generated {trap_size:,} entries in {elapsed:.3f}s ({speed:,.0f}/sec)")
+
+    return trap_dict
+
+# =================================================================
+# WORKER FUNCTION (VERSI TERBALIK)
+# =================================================================
+def worker_search_reverse(
+    trap_dict: Dict[int, int],
+    scalar_groups: List[List[int]],
+    result_queue: mp.Queue,
+    total_completed,
+    process_id: int,
+    max_experiments: int
+):
+    """
+    Worker: Mencari n_step * G di trap table
+    """
+    random.seed(os.getpid() + process_id + int(time.time() * 1000))
+
+    for n_exp in range(max_experiments):
+        # Generate random n_step
+        n_step = 0
+        for group in scalar_groups:
+            # If scalars_per_group is 4, random.randint(0, 4) means choose 0, 1, 2, 3, or 4 scalars.
+            # The original code had SCALARS_PER_GROUP = 4, so random.randint(0, 4) implies up to 4 scalars.
+            num_to_choose = random.randint(0, len(group)) # Adjusted to use len(group) for flexibility
+            if num_to_choose > 0:
+                chosen_scalars = random.sample(group, num_to_choose)
+                n_step += sum(chosen_scalars)
+
+        if n_step == 0:
+            continue
+
+        # Hitung n_step * G
+        n_step_bytes = n_step.to_bytes(32, 'big')
+        nG_pubkey = coincurve.PublicKey.from_valid_secret(n_step_bytes)
+
+        # Hitung fingerprint
+        fp = get_fingerprint(nG_pubkey)
+
+        # Cek di trap table
+        if fp in trap_dict:
+            k_trap = trap_dict[fp]
+            result_queue.put(
+                {
+                    'found': True,
+                    'k_trap': k_trap,
+                    'n_step': n_step,
+                    'experiments': n_exp + 1,
+                    'process_id': process_id
+                }
+            )
+            return
+
+        # Update progress
+        if n_exp % 1000 == 0:
+            with total_completed.get_lock():
+                total_completed.value += 1000
+
+    result_queue.put({'found': False, 'process_id': process_id})
+
+# =================================================================
+# VERIFICATION (VERSI TERBALIK)
+# =================================================================
+def verify_result_reverse(
+    target_pubkey: coincurve.PublicKey,
+    k_trap: int,
+    n_step: int
+) -> bool:
+    """
+    Verifikasi: T = n_step * G - k_trap * G
+    """
+    # Hitung n_step * G
+    n_step_bytes = n_step.to_bytes(32, 'big')
+    nG_pubkey = coincurve.PublicKey.from_valid_secret(n_step_bytes)
+
+    # Hitung k_trap * G
+    k_trap_bytes = k_trap.to_bytes(32, 'big')
+    kG_pubkey = coincurve.PublicKey.from_valid_secret(k_trap_bytes)
+
+    # Hitung -k_trap * G
+    neg_kG = point_negate(kG_pubkey)
+
+    # Hitung n_step * G - k_trap * G
+    calculated_pubkey = coincurve.PublicKey.combine_keys([nG_pubkey, neg_kG])
+
+    return calculated_pubkey == target_pubkey
+
+# =================================================================
+# MAIN SEARCH FUNCTION
+# =================================================================
+def search_private_key_reverse(
+    trap_dict: Dict[int, int],
+    scalar_groups: List[List[int]],
+    num_processes: int,
+    max_experiments_per_process: int
+) -> Optional[Tuple[int, int, int, int]]:
+    """Fungsi pencarian utama"""
+    print(f"[*] Starting search with {num_processes} processes")
+    print(f"[*] Max experiments per process: {max_experiments_per_process:,}")
+
+    result_queue = mp.Queue()
+    total_completed = mp.Value('i', 0)
+
+    processes = []
+    for i in range(num_processes):
+        p = mp.Process(
+            target=worker_search_reverse,
+            args=(
+                trap_dict,
+                scalar_groups,
+                result_queue,
+                total_completed,
+                i,
+                max_experiments_per_process
+            )
+        )
+        processes.append(p)
+        p.start()
+
+    search_start = time.time()
+    found = False
+    result = None
+
+    try:
+        while True:
+            if not result_queue.empty():
+                res = result_queue.get()
+                if res['found']:
+                    found = True
+                    result = res
+                    break
+
+            alive_count = sum(1 for p in processes if p.is_alive())
+            if alive_count == 0 and result_queue.empty():
+                break
+
+            elapsed = time.time() - search_start
+            current = total_completed.value
+            speed = current / elapsed if elapsed > 0 else 0
+
+            sys.stdout.write(
+                f"\r[Progress] Experiments: {current:,} | "
+                f"Speed: {speed:,.0f} it/s | "
+                f"Active: {alive_count}/{num_processes}"
+            )
+            sys.stdout.flush()
+
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\n[!] Search interrupted")
+
+    for p in processes:
+        p.terminate()
+        p.join()
+
+    if found and result:
+        print(f"\n[*] Found in process {result['process_id']} "
+              f"after {result['experiments']:,} experiments")
+        return result['k_trap'], result['n_step'], result['experiments'], result['process_id']
+
+    return None
+
+# =================================================================
+# MAIN PROGRAM
+# =================================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description='MITM Attack - Versi Terbalik',
+    )
+
+    parser.add_argument('--pubkey', type=str, required=True,
+                       help='Compressed public key (66 chars hex)')
+    parser.add_argument('--trap_size', type=int, default=2**13,
+                       help='Trap table size')
+    parser.add_argument('--max_experiments', type=int, default=2**100,
+                       help='Max experiments per process')
+    parser.add_argument('--processes', type=int, default=mp.cpu_count(),
+                       help='Number of CPU processes')
+
+    # Arguments for scalar group configuration, using the new defaults
+    parser.add_argument('--total_scalars', type=int, default=DEFAULT_TOTAL_SCALARS,
+                       help=f'Total number of scalars to generate (default: {DEFAULT_TOTAL_SCALARS})')
+    parser.add_argument('--start_exponent', type=int, default=DEFAULT_START_EXPONENT,
+                       help=f'Starting exponent for scalars (default: {DEFAULT_START_EXPONENT} for 2^{DEFAULT_START_EXPONENT})')
+    parser.add_argument('--scalars_per_group', type=int, default=DEFAULT_SCALARS_PER_GROUP,
+                       help=f'Number of scalars in each group (default: {DEFAULT_SCALARS_PER_GROUP})')
+
+    args = parser.parse_args()
+
+    if len(args.pubkey) != 66:
+        print("[ERROR] Compressed pubkey must be 66 characters")
+        return
+
+    print("=" * 70)
+    print("MITM ATTACK - VERSI TERBALIK")
+    print("=" * 70)
+
+    # Dekompresi target pubkey
+    print(f"[*] Target: {args.pubkey[:16]}...{args.pubkey[-16:]}")
+
+    try:
+        target_pubkey = decompress_pubkey(args.pubkey)
+        print(f"[*] Target decompressed")
+    except Exception as e:
+        print(f"[ERROR] Failed to decompress: {e}")
+        return
+
+    # Generate trap table
+    trap_dict = generate_trap_table_reverse(target_pubkey, args.trap_size)
+
+    # Tampilkan konfigurasi dan generate scalar groups
+    scalar_groups, full_scalars = get_scalar_groups(
+        args.total_scalars, args.start_exponent, args.scalars_per_group
+    )
+    num_groups = args.total_scalars // args.scalars_per_group # Recalculate num_groups for display
+
+    print(f"\n[*] Scalar groups untuk n_step (Total Scalars: {args.total_scalars}, Start Exponent: {args.start_exponent}, Scalars per Group: {args.scalars_per_group}):")
+    for i, group in enumerate(scalar_groups):
+        if i >= num_groups: # Avoid displaying partial groups if total_scalars isn't perfectly divisible
+            break
+        exponents = [int(s).bit_length() - 1 for s in group]
+        print(f"    Group {i}: {[f'2^{e}' for e in exponents]}")
+
+    print(f"[*] Each group: 0-{args.scalars_per_group} scalars")
+
+    # Jalankan pencarian
+    print("\n" + "=" * 70)
+    print("STARTING SEARCH")
+    print("=" * 70)
+
+    search_start = time.time()
+
+    result = search_private_key_reverse(
+        trap_dict=trap_dict,
+        scalar_groups=scalar_groups,
+        num_processes=args.processes,
+        max_experiments_per_process=args.max_experiments
+    )
+
+    total_time = time.time() - search_start
+
+    if result:
+        k_trap, n_step, experiments, process_id = result
+
+        # Hitung private key: K = n_step - k_trap mod N
+        private_key = (n_step - k_trap) % N
+
+        print("\n" + "=" * 70)
+        print("[+] COLLISION FOUND!")
+        print("=" * 70)
+        print(f"    Private Key: {hex(private_key)}")
+        print(f"    n_step: {n_step:,}")
+        print(f"    k_trap: {k_trap:,}")
+        print(f"    Calculation: {n_step} - {k_trap} = {private_key}")
+        print(f"    Process: {process_id}")
+        print(f"    Experiments: {experiments:,}")
+        print(f"    Search time: {total_time:.2f}s")
+
+        # Verifikasi
+        if verify_result_reverse(target_pubkey, k_trap, n_step):
+            print("[+] VERIFICATION PASSED!")
+
+            filename = f"found_key_{int(time.time())}.txt"
+            with open(filename, "w") as f:
+                f.write(f"Public Key: {args.pubkey}\n")
+                f.write(f"Private Key (hex): {hex(private_key)}\n")
+                f.write(f"Private Key (dec): {private_key}\n")
+                f.write(f"n_step: {n_step}\n")
+                f.write(f"k_trap: {k_trap}\n")
+                f.write(f"Formula: n_step * G = T + k_trap * G\n")
+                f.write(f"Calculation: K = n_step - k_trap mod N\n")
+                f.write(f"Process: {process_id}\n")
+                f.write(f"Experiments: {experiments}\n")
+                f.write(f"Search time: {total_time:.2f}s\n")
+                f.write(f"Found at: {datetime.now().isoformat()}\n")
+
+            print(f"[*] Key saved to {filename}")
+        else:
+            print("[-] VERIFICATION FAILED!")
+    else:
+        print(f"\n[-] Private key not found after {total_time:.2f}s")
+
+    print("\n" + "=" * 70)
+    print("PROGRAM COMPLETED")
+    print("=" * 70)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
